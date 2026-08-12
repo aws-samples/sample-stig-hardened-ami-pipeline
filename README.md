@@ -21,42 +21,22 @@ Key capabilities:
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│ CloudFormation Stack                                                │
-│                                                                     │
-│  ┌───────────────┐    ┌────────────────────┐                        │
-│  │ IAM Roles     │    │ Instance Profile   │                        │
-│  │ - Builder     │───▶│                    │                        │
-│  │ - Execution   │    └────────┬───────────┘                        │
-│  │ - Trigger*    │             │                                    │
-│  └───────────────┘    ┌────────▼───────────┐                        │
-│                       │ Infrastructure     │                        │
-│  ┌───────────────┐    │ Configuration      │                        │
-│  │ Image Recipe  │    └────────┬───────────┘                        │
-│  │ - STIG Build  │             │                                    │
-│  │ - OpenSCAP    │    ┌────────▼───────────┐                        │
-│  └───────┬───────┘    │ Distribution       │                        │
-│          │            │ Config + SSM Param │                        │
-│          │            └────────┬───────────┘                        │
-│          ▼                     ▼                                    │
-│  ┌─────────────────────────────────────────┐                        │
-│  │ Image Pipeline + Custom Build Workflow  │                        │
-│  └─────────────────────────────────────────┘                        │
-│          ▲                                                          │
-│          │                                                          │
-│  ┌───────┴──────────────────────────────────┐                       │
-│  │ Lambda Trigger* ◄── SNS Subscription*    │                       │
-│  │              (AL2/AL2023 AMI updates)    │                       │
-│  └──────────────────────────────────────────┘                       │
-│                                                                     │
-│  ┌──────────────────────────────────────────┐                       │
-│  │ S3 Compliance Reports + Access Logs      │                       │
-│  └──────────────────────────────────────────┘                       │
-└─────────────────────────────────────────────────────────────────────┘
+![Architecture diagram showing the pipeline account, where EC2 Image Builder builds, hardens, scans, and publishes an encrypted AMI with evidence retained in Amazon S3, and the workload OU, where a declarative policy restricts instance launches to the pipeline's AMIs](ARCHITECTURE.drawio.png)
 
-* Created only when `EnableAutoTrigger=true` and the selected base image has an Amazon Linux update topic.
-```
+Each build moves through the following stages, matching the numbered steps in the diagram:
+
+1. EC2 Image Builder launches a temporary build instance in your VPC with an encrypted root volume.
+2. The AWS-managed `stig-build-linux` component applies STIG hardening.
+3. Image Builder creates the encrypted AMI, then launches a temporary test instance from it.
+4. On the test instance, the `openscap-scan` component installs OpenSCAP and runs the DISA STIG, CIS Level 1, and CIS Level 2 scans in full. Because the scanner is installed on the test instance, it is not included in the published AMI.
+5. The same component computes a machine-readable gate decision (`gate-decision.json`) and a human-readable one (`gate-decision.txt`).
+6. The `openscap-gate` component uploads the decision and the scan reports to the encrypted, versioned reports bucket, and records the outcome on the AMI as the `StigGateDecision` tag.
+7. The gate enforces the uploaded decision: a missing profile, invalid scan output, or blocking high-severity STIG finding marks the image as failed, and the AMI is not distributed.
+8. On a pass, Image Builder distributes the encrypted AMI, updates the `/ami/<PipelineName>/latest` parameter, notifies subscribers, and optionally shares the AMI with your organization.
+
+The auto-trigger resources (the Lambda function and its SNS subscription to the Amazon Linux 2023 update topic) are created only when `EnableAutoTrigger=true`.
+
+The diagram source is [ARCHITECTURE.drawio](ARCHITECTURE.drawio), editable at [draw.io](https://app.diagrams.net/).
 
 ## Prerequisites
 
