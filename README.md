@@ -2,6 +2,8 @@
 
 ## Overview
 
+> **This is sample code, for non-production usage.** Work with your security and legal teams to meet your organizational security, regulatory, and compliance requirements before deployment. A passing release gate is not a certification or an authorization to operate. See [Disclaimer](#disclaimer) and [Known limitations](#known-limitations).
+
 This CloudFormation template deploys an EC2 Image Builder pipeline that produces DISA STIG-hardened Amazon Linux 2023 AMIs. The pipeline applies the AWS-managed `stig-build-linux` component with configurable hardening levels, assesses the resulting image with OpenSCAP, stores assessment evidence in Amazon S3, and publishes the latest successfully gated AMI ID to AWS Systems Manager Parameter Store for CI/CD consumption.
 
 Key capabilities:
@@ -63,6 +65,7 @@ CloudFormation displays these parameters in logical groups: **Pipeline and Build
 | `EnableFIPS` | `String` | No | `false` | Set to `true` to configure operating-system FIPS mode and reboot before assessment. When `false`, the five fixed FIPS-related high-severity rules remain in evidence but are excluded from the release gate. This setting is not a FIPS certification. |
 | `OrganizationId` | `String` | No | *(empty)* | AWS Organization ID for AMI sharing, such as `o-abcdef1234`. Leave empty to skip organization sharing. |
 | `ManagementAccountId` | `String` | No | *(empty)* | 12-digit AWS Organizations management account ID. Required when `OrganizationId` is set. |
+| `EvidenceBreakGlassPrincipalArn` | `String` | No | *(empty)* | IAM role or user ARN permitted to delete object versions or change versioning on the reports bucket. When set, all other principals are denied those actions, making stored evidence tamper-resistant. Leave empty to omit that protection. |
 | `NotificationEmail` | `String` | No | *(empty)* | Optional email to notify on build `AVAILABLE`/`FAILED`. Leave empty to create the SNS topic and EventBridge rule without a subscription (subscribe endpoints later). |
 | `EnableAmiLifecycle` | `String` | No | `false` | Set to `true` to create an optional EC2 Image Builder lifecycle policy that acts on older AMIs so workload accounts can only use recent images. |
 | `AmiLifecycleAction` | `String` | No | `DEPRECATE` | Action for AMIs older than `KeepLatestCount`: `DEPRECATE` (marks only, does not block launches), `DISABLE` (blocks new launches, reversible), or `DELETE` (deregisters, destructive). Use `DISABLE`/`DELETE` to enforce latest-only. |
@@ -495,6 +498,29 @@ The template creates two S3 buckets:
 - `<PipelineName>-access-logs-<AccountId>` for server access logs from the reports bucket.
 
 The reports bucket has AES-256 server-side encryption, public access blocking, versioning, TLS enforcement, 90-day lifecycle expiration for reports, and `LoggingConfiguration` targeting the access-logs bucket. The destination bucket has AES-256 encryption, public access blocking, versioning, TLS enforcement, 365-day lifecycle expiration, retained deletion policy, and a log-delivery policy constrained by source account and reports-bucket ARN. `AccessLogsBucketName` identifies the destination in stack outputs. Delivery is best effort and can be delayed.
+
+## Cost
+
+Deploying this template creates chargeable resources. Approximate costs, using eu-west-2 (London) on-demand pricing at the time of writing — check the [AWS Pricing Calculator](https://calculator.aws/) for current rates in your Region:
+
+| Item | Approximate cost |
+|------|------------------|
+| Standing cost | ~$2 per month per deployed pipeline, almost entirely the two customer-managed KMS keys at $1 each. SNS, EventBridge, the SSM parameter, and the trigger Lambda are negligible at this volume. |
+| Per build | ~$0.03-0.05. Two temporary instances (build and test) for roughly 20 minutes in total on the default `m6g.large`, plus negligible S3, KMS, and logging charges. |
+| Retained AMIs | ~$0.11-0.22 per image per month for the encrypted EBS snapshots. This is the only cost that grows over time; `EnableAmiLifecycle` can retire older images. |
+| Evidence in S3 | Negligible. Reports expire after 90 days and access logs after 365 days. |
+
+## Cleanup
+
+Deleting the stack does **not** remove everything, by design: the buckets and KMS keys use `DeletionPolicy: Retain` so that compliance evidence and the keys that decrypt published AMIs survive an accidental stack deletion. Published AMIs and their snapshots are created by Image Builder rather than CloudFormation, so they are not stack-managed either.
+
+To remove everything this template creates, in order:
+
+1. **Deregister the AMIs** the pipeline produced and delete their snapshots. Identify them by the `StigGateDecision` tag or the `<PipelineName>-*` name prefix. Any account still launching from a shared AMI loses access at this point.
+2. **Delete the stack.** This removes the pipeline, recipe, components, infrastructure and distribution configuration, IAM roles, the trigger Lambda, and the SNS topic.
+3. **Empty and delete the two buckets.** Both are versioned, so delete object versions and delete markers, not just current objects. Export any evidence you need to retain first. If you set `EvidenceBreakGlassPrincipalArn`, only that principal can delete object versions in the reports bucket, so use it for this step or remove the bucket policy statement first. Lifecycle expiration is performed by Amazon S3 itself and is unaffected by that statement.
+4. **Delete the SSM parameter** at `/ami/<PipelineName>/latest` if it remains.
+5. **Schedule deletion of the two KMS keys.** Do this last. Deleting `ImageEncryptionKey` permanently prevents launches from any AMI it encrypted, including images shared with other accounts. KMS enforces a waiting period of 7-30 days, during which deletion can be cancelled.
 
 ## Known limitations
 
