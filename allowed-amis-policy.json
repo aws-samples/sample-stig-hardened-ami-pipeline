@@ -1,0 +1,23 @@
+{
+  "ec2_attributes": {
+    "allowed_images_settings": {
+      "state": {
+        "@@assign": "enabled"
+      },
+      "image_criteria": {
+        "criteria_1": {
+          "allowed_image_providers": {
+            "@@assign": [
+              "<PIPELINE_ACCOUNT_ID>"
+            ]
+          },
+          "image_names": {
+            "@@assign": [
+              "<PIPELINE_NAME>-*"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

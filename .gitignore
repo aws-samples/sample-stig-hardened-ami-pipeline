@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Python tooling used for local validation
+__pycache__/
+.venv/
+build.log
+
+# Local security scan output
+.protoshield/

@@ -1,0 +1,1506 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: "EC2 Image Builder pipeline for producing DISA STIG-hardened AMIs with OpenSCAP compliance verification"
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Pipeline and Build Settings
+        Parameters:
+          - PipelineName
+          - BaseImage
+          - InstanceType
+          - EnableAutoTrigger
+      - Label:
+          default: Network Settings
+        Parameters:
+          - SubnetId
+          - SecurityGroupId
+      - Label:
+          default: STIG and Compliance Settings
+        Parameters:
+          - STIGLevel
+          - EnableFIPS
+      - Label:
+          default: Organization Sharing
+        Parameters:
+          - OrganizationId
+          - ManagementAccountId
+      - Label:
+          default: Build Notifications
+        Parameters:
+          - NotificationEmail
+      - Label:
+          default: AMI Lifecycle Settings
+        Parameters:
+          - EnableAmiLifecycle
+          - AmiLifecycleAction
+          - KeepLatestCount
+
+Parameters:
+  PipelineName:
+    Type: String
+    Default: stig-al2023-arm64-pipeline
+    MinLength: 3
+    MaxLength: 31
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,29}[a-z0-9]$"
+    ConstraintDescription: "Use 3-31 lowercase letters, numbers, and hyphens. Must start and end with a letter or number."
+    Description: "A name prefix used to identify all pipeline resources. Use a unique name per architecture variant (e.g., stig-al2023-arm64-pipeline, stig-al2023-x86-pipeline). Must be S3-compatible because it is used in bucket names."
+
+  BaseImage:
+    Type: String
+    Default: amazon-linux-2023-arm64
+    AllowedValues:
+      - amazon-linux-2023-x86
+      - amazon-linux-2023-arm64
+    Description: "The Amazon Linux 2023 base image for the pipeline, on x86_64 or arm64 (Graviton). This solution is built and tested for Amazon Linux 2023; extending it to other distributions requires validating their SCAP content and package names first."
+
+  InstanceType:
+    Type: String
+    Default: m6g.large
+    AllowedValues:
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+      - r5.large
+      - r5.xlarge
+      - t3.large
+      - t3.xlarge
+      - m6g.large
+      - m6g.xlarge
+      - c6g.large
+      - c6g.xlarge
+      - t4g.large
+      - t4g.xlarge
+    Description: "The EC2 instance type used for the Image Builder build instance. Must match the selected base image architecture and have sufficient resources for STIG hardening."
+
+  EnableAutoTrigger:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Whether to create the Amazon Linux 2023 base-image update trigger. When true, an SNS subscription, Lambda function, IAM role, and log group are created so the pipeline rebuilds when AWS publishes a new base image. Set false to use manual or customer-provided triggering only."
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: "The ID of the VPC subnet where the Image Builder build instance will be launched. Must have outbound internet access for SSM and Image Builder endpoints."
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: "The ID of the security group to attach to the Image Builder build instance. Must allow outbound HTTPS (port 443) for AWS service communication."
+
+  STIGLevel:
+    Type: String
+    Default: High
+    AllowedValues:
+      - High
+      - Medium
+      - Low
+    Description: "The DISA STIG hardening severity level applied by the stig-build-linux component. High applies all controls, Medium skips CAT III, Low applies only CAT I."
+
+  EnableFIPS:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Whether to enable FIPS 140 mode in the built image. When true, a build component runs fips-mode-setup --enable and reboots so FIPS activates, and the OpenSCAP scan validates the FIPS controls. When false, FIPS is left disabled and the FIPS-specific STIG rules are excluded from the gate. This setting is not a certification."
+
+  OrganizationId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^o-[a-z0-9]{10,32}$"
+    ConstraintDescription: "Must be empty or a valid AWS Organizations ID such as o-abcdef1234."
+    Description: "The AWS Organization ID to share the output AMI with (e.g., o-abcdef1234). Leave empty to skip cross-account sharing."
+
+  ManagementAccountId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[0-9]{12}$"
+    ConstraintDescription: "Must be empty or a 12-digit AWS account ID."
+    Description: "The 12-digit AWS account ID of the Organization management account. Required when OrganizationId is set and used to construct the Organization ARN for AMI sharing."
+
+  NotificationEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: "Must be empty or a valid email address."
+    Description: "Optional email address to notify when an image build reaches AVAILABLE or FAILED. Leave empty to create the notification topic and rule without an email subscription (subscribe endpoints later)."
+
+  EnableAmiLifecycle:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Whether to create an EC2 Image Builder lifecycle policy that applies an action to older AMIs so workload accounts can only use the most recent images. Left disabled by default; enable and choose AmiLifecycleAction to enforce."
+
+  AmiLifecycleAction:
+    Type: String
+    Default: DEPRECATE
+    AllowedValues:
+      - DEPRECATE
+      - DISABLE
+      - DELETE
+    Description: "Action applied to AMIs older than KeepLatestCount. DEPRECATE only marks them (does NOT block launches); DISABLE prevents new launches and is reversible; DELETE deregisters them (destructive). Use DISABLE or DELETE to actually enforce latest-only."
+
+  KeepLatestCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 1000
+    Description: "Number of most recent AMIs to retain unaffected (keep the latest plus rollback headroom). Older AMIs receive the selected AmiLifecycleAction."
+
+Mappings:
+  RootDeviceNames:
+    amazon-linux-2023-x86:
+      DeviceName: /dev/xvda
+    amazon-linux-2023-arm64:
+      DeviceName: /dev/xvda
+
+  AmiUpdateTopics:
+    amazon-linux-2023-x86:
+      TopicArn: "arn:aws:sns:us-east-1:137112412989:amazon-linux-2023-ami-updates"
+    amazon-linux-2023-arm64:
+      TopicArn: "arn:aws:sns:us-east-1:137112412989:amazon-linux-2023-ami-updates"
+
+Conditions:
+  ShareToOrganization: !Not [!Equals [!Ref OrganizationId, ""]]
+  AutoTriggerEnabled: !Equals [!Ref EnableAutoTrigger, "true"]
+  FIPSEnabled: !Equals [!Ref EnableFIPS, "true"]
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+  AmiLifecycleEnabled: !Equals [!Ref EnableAmiLifecycle, "true"]
+
+Rules:
+  ManagementAccountRequiredWithOrg:
+    RuleCondition: !Not [!Equals [!Ref OrganizationId, ""]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref ManagementAccountId, ""]]
+        AssertDescription: "ManagementAccountId is required when OrganizationId is set"
+
+  Arm64BaseImageRequiresGravitonInstance:
+    RuleCondition:
+      Fn::Contains:
+        - - amazon-linux-2023-arm64
+        - !Ref BaseImage
+    Assertions:
+      - Assert:
+          Fn::Contains:
+            - - m6g.large
+              - m6g.xlarge
+              - c6g.large
+              - c6g.xlarge
+              - t4g.large
+              - t4g.xlarge
+            - !Ref InstanceType
+        AssertDescription: "arm64 base images require Graviton instance types: m6g, c6g, or t4g."
+
+  X86BaseImageRequiresX86Instance:
+    RuleCondition:
+      Fn::Not:
+        - Fn::Contains:
+            - - amazon-linux-2023-arm64
+            - !Ref BaseImage
+    Assertions:
+      - Assert:
+          Fn::Contains:
+            - - m5.large
+              - m5.xlarge
+              - m5.2xlarge
+              - c5.large
+              - c5.xlarge
+              - c5.2xlarge
+              - r5.large
+              - r5.xlarge
+              - t3.large
+              - t3.xlarge
+            - !Ref InstanceType
+        AssertDescription: "x86 base images require x86 instance types: m5, c5, r5, or t3."
+
+Resources:
+  ImageEncryptionKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "Encrypts ${PipelineName} Image Builder EBS volumes and distributed AMI snapshots"
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - !If
+            - ShareToOrganization
+            # kms:ViaService scopes the org-wide grant to the EC2 launch
+            # path (EBS presents as ec2.<region>.amazonaws.com): member
+            # accounts can decrypt snapshots by launching the shared AMI,
+            # but cannot call kms:Decrypt against the key directly.
+            - Sid: AllowOrganizationUseOfSharedEncryptedAmis
+              Effect: Allow
+              Principal: "*"
+              Action:
+                - kms:DescribeKey
+                - kms:Decrypt
+                - "kms:ReEncrypt*"
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  aws:PrincipalOrgID: !Ref OrganizationId
+                  kms:ViaService: !Sub "ec2.${AWS::Region}.amazonaws.com"
+            - !Ref "AWS::NoValue"
+          - !If
+            - ShareToOrganization
+            - Sid: AllowOrganizationGrantsForAwsResources
+              Effect: Allow
+              Principal: "*"
+              Action: kms:CreateGrant
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  aws:PrincipalOrgID: !Ref OrganizationId
+                Bool:
+                  kms:GrantIsForAWSResource: true
+            - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Project
+          Value: !Ref PipelineName
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: ImageEncryption
+
+  ImageEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AliasName: !Sub "alias/${PipelineName}-image-encryption"
+      TargetKeyId: !Ref ImageEncryptionKey
+
+  NotificationEncryptionKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "Encrypts ${PipelineName} SNS build-state notifications"
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowEventBridgeToPublishEncryptedNotifications
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - "kms:GenerateDataKey*"
+              - kms:Decrypt
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref "AWS::AccountId"
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${PipelineName}-image-state-change"
+      Tags:
+        - Key: Project
+          Value: !Ref PipelineName
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NotificationEncryption
+
+  NotificationEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AliasName: !Sub "alias/${PipelineName}-notification-encryption"
+      TargetKeyId: !Ref NotificationEncryptionKey
+
+  ImageBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${PipelineName}-image-builder-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ComplianceReportUpload
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                Resource: !Sub "arn:aws:s3:::${PipelineName}-compliance-reports-${AWS::AccountId}/reports/*"
+              # The test phase records the release-gate outcome on the output
+              # AMI so a rejected image is identifiable in the account (Allowed
+              # AMIs criteria cannot filter on tags). Restricted to the four
+              # gate tag keys, so the role cannot rewrite any other tag.
+              - Sid: TagOutputImageWithGateOutcome
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}::image/*"
+                Condition:
+                  ForAllValues:StringEquals:
+                    aws:TagKeys:
+                      - StigGateDecision
+                      - StigGateProfile
+                      - StigGateEvaluatedAt
+                      - StigGateRecipeVersion
+      Tags:
+        - Key: Project
+          Value: !Ref PipelineName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ImageBuilderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${PipelineName}-instance-profile"
+      Roles:
+        - !Ref ImageBuilderRole
+
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "Log-delivery destination bucket; enabling access logging on it would recurse."
+    Properties:
+      BucketName: !Sub "${PipelineName}-access-logs-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 365
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - Key: Project
+          Value: !Ref PipelineName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${AccessLogsBucket.Arn}/compliance-reports-access-logs/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref "AWS::AccountId"
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:s3:::${PipelineName}-compliance-reports-${AWS::AccountId}"
+          - Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub "${AccessLogsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  ComplianceReportsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: AccessLogsBucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${PipelineName}-compliance-reports-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldReports
+            Status: Enabled
+            ExpirationInDays: 90
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: compliance-reports-access-logs/
+      Tags:
+        - Key: Project
+          Value: !Ref PipelineName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ComplianceReportsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ComplianceReportsBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ComplianceReportsBucket.Arn
+              - !Sub "${ComplianceReportsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # The assessment is split across two components because a component's inline
+  # Data document is limited to 16,000 characters. This one scans and decides;
+  # OpenSCAPGateComponent uploads, labels, and enforces.
+  OpenSCAPScanComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: !Sub "${PipelineName}-openscap-scan"
+      Description: "Runs full OpenSCAP STIG and CIS assessments and computes the release-gate decision"
+      Platform: Linux
+      SupportedOsVersions:
+        - "Amazon Linux 2023"
+      Version: "1.0.0"
+      # No !Sub here: this document contains no template variables, and keeping
+      # it a literal block means the embedded shell and Python need no escaping.
+      Data: |
+        name: OpenSCAPScan
+        schemaVersion: 1.0
+        parameters:
+        - FipsEnabled:
+            type: string
+            default: "false"
+        phases:
+        - name: test
+          steps:
+          - name: InstallOpenSCAP
+            action: ExecuteBash
+            inputs:
+              commands:
+              - |
+                # Install OpenSCAP, SCAP content, and Python from the
+                # AWS-maintained Amazon Linux 2023 repositories.
+                sudo dnf install -y openscap-scanner scap-security-guide python3
+          - name: RunScans
+            action: ExecuteBash
+            inputs:
+              commands:
+              - |
+                # Locate the Amazon Linux 2023 SCAP data stream.
+                CONTENT=/usr/share/xml/scap/ssg/content/ssg-al2023-ds.xml
+                if [ ! -f "$CONTENT" ]; then
+                  echo "No SCAP content"
+                  echo 1 > /tmp/stig-exit-code
+                  exit 0
+                fi
+                echo "$CONTENT" > /tmp/scap-content-file.txt
+                # Read the AMI ID under test from instance metadata (IMDSv2).
+                # Evidence is only meaningful if it is attributable to a
+                # specific AMI, so this retries and then fails the build rather
+                # than filing the reports under a placeholder identifier.
+                AMI_ID=""
+                for attempt in 1 2 3; do
+                  TOKEN=$(curl -s -m 5 -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300" 2> /dev/null)
+                  if [ -n "$TOKEN" ]; then
+                    AMI_ID=$(curl -s -m 5 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/ami-id 2> /dev/null)
+                  fi
+                  # Accept only a well-formed AMI ID; an error body must not
+                  # become the evidence prefix.
+                  case "$AMI_ID" in
+                    ami-*) break ;;
+                    *) AMI_ID=""; sleep 3 ;;
+                  esac
+                done
+                if [ -z "$AMI_ID" ]; then
+                  echo "FATAL: could not read ami-id from IMDSv2 after 3 attempts. Failing the build rather than filing unattributable evidence." >&2
+                  exit 1
+                fi
+                echo "reports/$(date -u +%Y-%m-%d)/$AMI_ID" > /tmp/report-prefix.txt
+                echo "$AMI_ID" > /tmp/ami-id.txt
+                # Discover the STIG and CIS profiles available in the data stream.
+                PROFILES=$(oscap info "$CONTENT" 2> /dev/null | grep -oE 'xccdf_org\.ssgproject\.content_profile_[a-z0-9_]+' | sort -u)
+                STIG_PROFILE=$(echo "$PROFILES" | grep -E '_profile_stig$' | head -1)
+                CIS_L1_PROFILE=$(echo "$PROFILES" | grep -Ei 'cis.*l1|cis_level1' | head -1)
+                CIS_L2_PROFILE=$(echo "$PROFILES" | grep -Ei 'cis.*l2|cis_level2|cis_workstation_l2' | head -1)
+                if [ -n "$STIG_PROFILE" ]; then
+                  echo "$STIG_PROFILE" > /tmp/stig-profile.txt
+                else
+                  echo unavailable > /tmp/stig-profile.txt
+                fi
+                [ -n "$CIS_L2_PROFILE" ] || CIS_L2_PROFILE=$(echo "$PROFILES" | grep -E '_profile_cis$' | head -1)
+                # Run each scan in full (no rule selection filters) and record its exit
+                # code. OpenSCAP exit code 2 means the scan completed with failing
+                # rules and is a valid result.
+                scan() {
+                  label=$1
+                  profile=$2
+                  if [ -z "$profile" ]; then
+                    echo "$label unavailable; skipped."
+                    return
+                  fi
+                  set +e
+                  oscap xccdf eval --profile "$profile" --results "/tmp/$label-results.xml" --report "/tmp/$label-report.html" "$CONTENT"
+                  scan_exit=$?
+                  set -e
+                  echo "$scan_exit" > "/tmp/$label-exit-code"
+                }
+                scan stig "$STIG_PROFILE"
+                scan cis-l1 "$CIS_L1_PROFILE"
+                scan cis-l2 "$CIS_L2_PROFILE"
+          - name: SummarizeResults
+            action: ExecuteBash
+            inputs:
+              commands:
+              - |
+                # Write the gate decision before it is enforced, so the uploaded
+                # decision is the decision the pipeline acted on.
+                cat > /tmp/evaluate-gate.py << 'GATE_SCRIPT'
+                """Evaluate the STIG release gate from the OpenSCAP outputs.
+
+                Writes gate-decision.json/.txt, one summary per baseline, and
+                compliance-summary.txt. Only high-severity STIG results gate the
+                release; CIS results are informational.
+                """
+                import json
+                import sys
+                from collections import Counter
+                from pathlib import Path
+                from xml.etree.ElementTree import parse
+
+                WORK_DIR = Path(sys.argv[2] if len(sys.argv) > 2 else "/tmp")
+                FIPS_ENABLED = sys.argv[1].lower() == "true"
+                BLOCKING_STATUSES = ("fail", "error", "unknown", "notchecked")
+                NO_CHECK_MESSAGE = "No candidate or applicable check found."
+                # Rules fixed by enabling FIPS mode: when FIPS is disabled by choice,
+                # these are excluded from the gate but still reported.
+                FIPS_RULE_IDS = set(
+                    "xccdf_org.ssgproject.content_rule_" + suffix
+                    for suffix in (
+                        "enable_fips_mode",
+                        "enable_dracut_fips_module",
+                        "sysctl_crypto_fips_enabled",
+                        "configure_crypto_policy",
+                        "harden_sshd_ciphers_openssh_conf_crypto_policy",
+                    )
+                )
+                BASELINES = {
+                    "stig": "STIG baseline",
+                    "cis-l1": "CIS Level 1 (Server) baseline",
+                    "cis-l2": "CIS Level 2 (Server) baseline",
+                }
+
+                def read_text(name, default="unavailable"):
+                    try:
+                        return (WORK_DIR / name).read_text().strip() or default
+                    except OSError:
+                        return default
+
+                def tag_of(element):
+                    return element.tag.rsplit("}", 1)[-1]
+
+                def read_rule_results(baseline):
+                    """Return (rule results, file present, parse error)."""
+                    results_file = WORK_DIR / (baseline + "-results.xml")
+                    if not results_file.is_file():
+                        return [], False, None
+                    try:
+                        results = []
+                        for element in parse(results_file).getroot().iter():
+                            if tag_of(element) != "rule-result":
+                                continue
+                            status = next(
+                                ((child.text or "unknown").strip().lower()
+                                 for child in element if tag_of(child) == "result"),
+                                "unknown",
+                            )
+                            message = " ".join(
+                                (child.text or "").strip()
+                                for child in element if tag_of(child) == "message"
+                            )
+                            results.append((
+                                element.get("idref", "unknown"),
+                                element.get("severity", "unknown").lower(),
+                                status,
+                                message,
+                            ))
+                        return results, True, None
+                    except Exception:
+                        return [], True, "invalid XML"
+
+                scan_results = {key: read_rule_results(key) for key in BASELINES}
+                stig_results, stig_present, stig_error = scan_results["stig"]
+                stig_profile = read_text("stig-profile.txt")
+                profile_present = stig_profile != "unavailable"
+                try:
+                    exit_code = int(read_text("stig-exit-code"))
+                except ValueError:
+                    exit_code = None
+
+                # Classify every high-severity STIG result.
+                blocking_findings = []
+                excluded_fips_findings = []
+                manual_review_findings = []
+                if stig_present and not stig_error:
+                    for rule_id, severity, status, message in stig_results:
+                        if severity != "high" or status not in BLOCKING_STATUSES:
+                            continue
+                        finding = {"rule_id": rule_id, "result": status}
+                        if not FIPS_ENABLED and rule_id in FIPS_RULE_IDS:
+                            excluded_fips_findings.append(finding)
+                        elif status == "notchecked" and NO_CHECK_MESSAGE in message:
+                            manual_review_findings.append(finding)
+                        else:
+                            blocking_findings.append(finding)
+                for findings in (blocking_findings, excluded_fips_findings, manual_review_findings):
+                    findings.sort(key=lambda item: (item["rule_id"], item["result"]))
+
+                # The gate fails closed: any reason below forces FAIL.
+                reasons = []
+                if exit_code not in (0, 2):
+                    reasons.append("STIG scan exit code is missing, invalid, or unexpected.")
+                if not profile_present:
+                    reasons.append("A STIG profile was not discovered.")
+                if not stig_present:
+                    reasons.append("STIG results XML is missing.")
+                elif stig_error:
+                    reasons.append("STIG results XML is invalid.")
+                elif not stig_results:
+                    reasons.append("STIG results XML contains no rule results.")
+                if blocking_findings:
+                    reasons.append(f"{len(blocking_findings)} high-severity STIG result(s) have a blocking status.")
+                decision = "FAIL" if reasons else "PASS"
+                if not reasons:
+                    if manual_review_findings:
+                        reasons = ["No blocking high-severity results; manual-review findings are recorded separately."]
+                    else:
+                        reasons = ["STIG scan evidence is present and no blocking high-severity results were found."]
+
+                decision_record = {
+                    "schema_version": "1.0",
+                    "decision": decision,
+                    "profile": stig_profile,
+                    "profile_present": profile_present,
+                    "fips_enabled": FIPS_ENABLED,
+                    "scan_exit_code": exit_code,
+                    "results_present": stig_present,
+                    "results_valid": stig_present and not stig_error,
+                    "rule_result_count": len(stig_results),
+                    "blocking_statuses": list(BLOCKING_STATUSES),
+                    "blocking_findings": blocking_findings,
+                    "manual_review_findings": manual_review_findings,
+                    "fips_exclusion_policy_active": not FIPS_ENABLED,
+                    "excluded_fips_findings": excluded_fips_findings,
+                    "reasons": reasons,
+                }
+                (WORK_DIR / "gate-decision.json").write_text(json.dumps(decision_record, indent=2, sort_keys=True) + "\n")
+
+                def rule_lines(findings):
+                    if not findings:
+                        return ["- (none)"]
+                    return [f"- {item['rule_id']} ({item['result']})" for item in findings]
+
+                text_lines = [
+                    f"OpenSCAP STIG release gate decision: {decision}",
+                    f"Profile: {stig_profile}",
+                    "FIPS enabled: " + ("yes" if FIPS_ENABLED else "no"),
+                    "Scan exit code: " + (str(exit_code) if exit_code is not None else "unavailable"),
+                    "STIG results valid: " + ("yes" if stig_present and not stig_error else "no"),
+                    f"STIG rule results: {len(stig_results)}",
+                    "Blocking statuses: " + ", ".join(BLOCKING_STATUSES),
+                    f"Blocking findings: {len(blocking_findings)}",
+                    f"Manual-review findings: {len(manual_review_findings)}",
+                    f"Excluded FIPS findings: {len(excluded_fips_findings)}",
+                    "",
+                    "Reasons:",
+                ]
+                text_lines += ["- " + reason for reason in reasons]
+                text_lines += ["", "Blocking rule IDs:"] + rule_lines(blocking_findings)
+                text_lines += ["", "Manual-review rule IDs:"] + rule_lines(manual_review_findings)
+                text_lines += ["", "Excluded FIPS rule IDs:"] + rule_lines(excluded_fips_findings)
+                (WORK_DIR / "gate-decision.txt").write_text("\n".join(text_lines) + "\n")
+
+                for key, label in BASELINES.items():
+                    results, present, error = scan_results[key]
+                    if not present:
+                        lines = [label + ": no results (profile unavailable)"]
+                    elif error:
+                        lines = [label + ": invalid results XML"]
+                    else:
+                        counts = Counter((severity, status) for _, severity, status, _ in results)
+                        high_findings = sorted(
+                            item for item in results
+                            if item[1] == "high" and item[2] in BLOCKING_STATUSES
+                        )
+                        lines = [label, "Counts by severity and result:"]
+                        lines += [
+                            f"  {severity} {status} = {counts[severity, status]}"
+                            for severity, status in sorted(counts)
+                        ]
+                        lines.append("High severity fail/error/unknown/notchecked results:")
+                        if high_findings:
+                            lines += [f"  - {rule_id} ({status})" for rule_id, _, status, _ in high_findings]
+                        else:
+                            lines.append("  (none)")
+                    (WORK_DIR / (key + "-summary.txt")).write_text("\n".join(lines) + "\n")
+
+                summary_lines = [
+                    "Assessment summary for AMI: " + read_text("ami-id.txt", "unknown"),
+                    "STIG profile: " + stig_profile,
+                    "Release gate decision: " + decision,
+                    "Gate scope: STIG high-severity fail, error, unknown, and notchecked results; CIS results are informational.",
+                ]
+                if FIPS_ENABLED:
+                    summary_lines.append("FIPS: enabled; fixed FIPS rules are gated.")
+                else:
+                    summary_lines.append("FIPS: disabled; fixed FIPS high-severity results are reported but excluded from the gate.")
+                for key in BASELINES:
+                    summary_lines += ["----", (WORK_DIR / (key + "-summary.txt")).read_text().rstrip()]
+                (WORK_DIR / "compliance-summary.txt").write_text("\n".join(summary_lines) + "\n")
+                GATE_SCRIPT
+                python3 /tmp/evaluate-gate.py "{{ FipsEnabled }}" || { echo '{"schema_version":"1.0","decision":"FAIL"}' > /tmp/gate-decision.json; echo 'Gate: FAIL (evaluator error)' > /tmp/gate-decision.txt; }
+                cat /tmp/compliance-summary.txt 2> /dev/null || cat /tmp/gate-decision.txt
+      Tags:
+        Project: !Ref PipelineName
+        ManagedBy: CloudFormation
+
+  # Consumes the artifacts OpenSCAPScanComponent leaves in /tmp on the same
+  # test instance. Both components declare only a test phase, so Image Builder
+  # runs them in the order the recipe lists them: scan, then gate. Keeping the
+  # gate in its own component preserves the decide-upload-label-enforce order.
+  OpenSCAPGateComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: !Sub "${PipelineName}-openscap-gate"
+      Description: "Uploads the assessment evidence, records the gate outcome on the AMI, and enforces the release gate"
+      Platform: Linux
+      SupportedOsVersions:
+        - "Amazon Linux 2023"
+      Version: "1.0.0"
+      Data: !Sub |
+        name: OpenSCAPGate
+        schemaVersion: 1.0
+        parameters:
+        - RecipeVersion:
+            type: string
+            default: "unknown"
+        phases:
+        - name: test
+          steps:
+          - name: UploadReports
+            action: ExecuteBash
+            inputs:
+              commands:
+              - |
+                # Upload evidence and the precomputed gate decision before the gate is
+                # enforced, so failed builds still retain their evidence.
+                #
+                # Upload is fail-closed: a missing required artifact, or any
+                # failed copy, fails this step so an image is never published
+                # with its evidence absent. Every artifact is attempted first,
+                # so one failure does not discard the rest of the evidence.
+                BUCKET="${PipelineName}-compliance-reports-${AWS::AccountId}"
+                PREFIX=$(cat /tmp/report-prefix.txt)
+                AMI_ID=$(cat /tmp/ami-id.txt)
+                RECIPE_VERSION="{{ RecipeVersion }}"
+                UPLOAD_FAILURES=0
+                # put <local file> <key suffix> <baseline tag> <required|optional>
+                # The fourth argument is always supplied, so the function never
+                # depends on how the shell expands an unset parameter.
+                # Scan artifacts are optional-if-absent because an unavailable
+                # CIS profile is a legitimate outcome, and any condition that
+                # removes the STIG results makes the gate decision FAIL. The
+                # decision artifacts are always written, including by the
+                # evaluator-crash fallback, so they are required here.
+                put() {
+                  if [ ! -f "$1" ]; then
+                    if [ "$4" = "required" ]; then
+                      echo "FATAL: required evidence artifact missing: $1" >&2
+                      UPLOAD_FAILURES=$((UPLOAD_FAILURES + 1))
+                    fi
+                    return 0
+                  fi
+                  if ! aws s3 cp "$1" "s3://$BUCKET/$2"; then
+                    echo "FATAL: evidence upload failed: $2" >&2
+                    UPLOAD_FAILURES=$((UPLOAD_FAILURES + 1))
+                    return 0
+                  fi
+                  # Tags carry traceability metadata, not the evidence itself, so
+                  # a tagging failure warns and is reported in the build log.
+                  aws s3api put-object-tagging --bucket "$BUCKET" --key "$2" --tagging "TagSet=[{Key=ami-id,Value=$AMI_ID},{Key=recipe-version,Value=$RECIPE_VERSION},{Key=pipeline,Value=${PipelineName}},{Key=baseline,Value=$3}]" || echo "WARN: tag $2"
+                }
+                for baseline in stig cis-l1 cis-l2; do
+                  for file in report.html results.xml summary.txt; do
+                    put "/tmp/$baseline-$file" "$PREFIX/$baseline/$baseline-$file" "$baseline" optional
+                  done
+                  put "/tmp/$baseline-exit-code" "$PREFIX/$baseline/$baseline-exit-code.txt" "$baseline" optional
+                done
+                put /tmp/compliance-summary.txt "$PREFIX/compliance-summary.txt" all optional
+                put /tmp/gate-decision.json "$PREFIX/gate-decision.json" gate required
+                put /tmp/gate-decision.txt "$PREFIX/gate-decision.txt" gate required
+                if [ "$UPLOAD_FAILURES" -ne 0 ]; then
+                  echo "FATAL: $UPLOAD_FAILURES evidence artifact(s) missing or not uploaded. Failing the build so no image is published without its evidence." >&2
+                  exit 1
+                fi
+                echo "Evidence uploaded to s3://$BUCKET/$PREFIX/"
+          - name: TagImageWithGateOutcome
+            action: ExecuteBash
+            inputs:
+              commands:
+              - |
+                # Record the gate outcome on the output AMI. A gate FAIL blocks
+                # distribution and the SSM parameter update, but the AMI created
+                # in the build phase still exists in this account; Allowed AMIs
+                # criteria match on provider and name and cannot distinguish it.
+                # This tag makes a rejected image identifiable to operators and
+                # to tag-based controls. Fail-closed: an image that could not be
+                # labelled is not published.
+                AMI_ID=$(cat /tmp/ami-id.txt)
+                DECISION=$(python3 -c "import json; print(json.load(open('/tmp/gate-decision.json'))['decision'])" 2> /dev/null || echo FAIL)
+                PROFILE=$(cat /tmp/stig-profile.txt 2> /dev/null || echo unavailable)
+                if ! aws ec2 create-tags --region ${AWS::Region} --resources "$AMI_ID" --tags "Key=StigGateDecision,Value=$DECISION" "Key=StigGateProfile,Value=$PROFILE" "Key=StigGateEvaluatedAt,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" "Key=StigGateRecipeVersion,Value={{ RecipeVersion }}"; then
+                  echo "FATAL: could not tag $AMI_ID with the gate outcome ($DECISION)." >&2
+                  exit 1
+                fi
+                echo "Tagged $AMI_ID with StigGateDecision=$DECISION"
+          - name: ValidateOpenSCAPResult
+            action: ExecuteBash
+            inputs:
+              commands:
+              - |
+                # Enforce the uploaded gate decision: fail unless schema 1.0 PASS.
+                python3 - << 'VALIDATE_SCRIPT'
+                import json
+                import sys
+
+                with open("/tmp/gate-decision.json") as handle:
+                    decision = json.load(handle)
+                print(open("/tmp/gate-decision.txt").read(), end="")
+                sys.exit(0 if (decision["schema_version"], decision["decision"]) == ("1.0", "PASS") else 1)
+                VALIDATE_SCRIPT
+      Tags:
+        Project: !Ref PipelineName
+        ManagedBy: CloudFormation
+
+  EnableFIPSComponent:
+    Type: AWS::ImageBuilder::Component
+    Condition: FIPSEnabled
+    Properties:
+      Name: !Sub "${PipelineName}-enable-fips"
+      Description: "Enables FIPS 140 mode on Amazon Linux 2023 and reboots so it activates before the compliance scan"
+      Platform: Linux
+      SupportedOsVersions:
+        - "Amazon Linux 2023"
+      Version: "1.0.0"
+      Data: |
+        name: EnableFIPS
+        description: Enables FIPS mode and reboots so FIPS activates before the image is captured
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: EnableFIPSMode
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      if ! command -v fips-mode-setup >/dev/null 2>&1; then
+                        sudo dnf install -y crypto-policies-scripts
+                      fi
+                      sudo fips-mode-setup --enable
+                      echo "FIPS mode configured. A reboot is required for activation."
+              - name: RebootForFIPS
+                action: Reboot
+                inputs:
+                  delaySeconds: 0
+      Tags:
+        Project: !Ref PipelineName
+        ManagedBy: CloudFormation
+
+  STIGImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: !Sub "${PipelineName}-stig-recipe"
+      ParentImage: !Sub "arn:aws:imagebuilder:${AWS::Region}:aws:image/${BaseImage}/x.x.x"
+      BlockDeviceMappings:
+        - DeviceName: !FindInMap [RootDeviceNames, !Ref BaseImage, DeviceName]
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            KmsKeyId: !GetAtt ImageEncryptionKey.Arn
+      Components:
+        - ComponentArn: !Sub "arn:aws:imagebuilder:${AWS::Region}:aws:component/stig-build-linux/x.x.x"
+          Parameters:
+            - Name: Level
+              Value:
+                - !Ref STIGLevel
+            - Name: InstallPackages
+              Value:
+                - "Yes"
+        - !If
+          - FIPSEnabled
+          - ComponentArn: !GetAtt EnableFIPSComponent.Arn
+          - !Ref "AWS::NoValue"
+        # Order matters: the scan component writes the decision and evidence to
+        # /tmp, and the gate component uploads, labels, and enforces it.
+        - ComponentArn: !GetAtt OpenSCAPScanComponent.Arn
+          Parameters:
+            - Name: FipsEnabled
+              Value:
+                - !If [FIPSEnabled, "true", "false"]
+        - ComponentArn: !GetAtt OpenSCAPGateComponent.Arn
+          Parameters:
+            - Name: RecipeVersion
+              Value:
+                - "1.0.0"
+      Version: "1.0.0"
+      Tags:
+        Project: !Ref PipelineName
+        ManagedBy: CloudFormation
+
+  InfrastructureConfig:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: !Sub "${PipelineName}-infra-config"
+      InstanceProfileName: !Ref ImageBuilderInstanceProfile
+      InstanceTypes:
+        - !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      TerminateInstanceOnFailure: true
+      InstanceMetadataOptions:
+        HttpTokens: required
+      Tags:
+        Project: !Ref PipelineName
+        ManagedBy: CloudFormation
+
+  DistributionConfig:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: !Sub "${PipelineName}-dist-config"
+      Distributions:
+        - Region: !Ref "AWS::Region"
+          AmiDistributionConfiguration:
+            Name: !Sub "${PipelineName}-{{imagebuilder:buildDate}}"
+            KmsKeyId: !GetAtt ImageEncryptionKey.Arn
+            LaunchPermissionConfiguration: !If
+              - ShareToOrganization
+              - OrganizationArns:
+                  - !Sub "arn:aws:organizations::${ManagementAccountId}:organization/${OrganizationId}"
+              - !Ref "AWS::NoValue"
+          SsmParameterConfigurations:
+            - AmiAccountId: !Ref "AWS::AccountId"
+              ParameterName: !Sub "/ami/${PipelineName}/latest"
+              DataType: "aws:ec2:image"
+      Tags:
+        Project: !Ref PipelineName
+        ManagedBy: CloudFormation
+
+  BuildWorkflow:
+    Type: AWS::ImageBuilder::Workflow
+    Properties:
+      Name: !Sub "${PipelineName}-build-workflow"
+      Description: "Custom build workflow that skips InventoryCollection to avoid SSM conflicts with STIG-hardened instances"
+      Type: BUILD
+      Version: "1.0.0"
+      Data: |
+        name: STIGBuildWorkflow
+        description: Build workflow without InventoryCollection step
+        schemaVersion: 1.0
+        steps:
+          - name: LaunchBuildInstance
+            action: LaunchInstance
+            onFailure: Abort
+            inputs:
+              waitFor: ssmAgent
+          - name: ApplyBuildComponents
+            action: ExecuteComponents
+            onFailure: Abort
+            inputs:
+              instanceId.$: $.stepOutputs.LaunchBuildInstance.instanceId
+          - name: RunSanitizeScript
+            action: SanitizeInstance
+            onFailure: Abort
+            inputs:
+              instanceId.$: $.stepOutputs.LaunchBuildInstance.instanceId
+          - name: CreateOutputAMI
+            action: CreateImage
+            onFailure: Abort
+            inputs:
+              instanceId.$: $.stepOutputs.LaunchBuildInstance.instanceId
+          - name: TerminateBuildInstance
+            action: TerminateInstance
+            onFailure: Continue
+            inputs:
+              instanceId.$: $.stepOutputs.LaunchBuildInstance.instanceId
+        outputs:
+          - name: ImageId
+            value: $.stepOutputs.CreateOutputAMI.imageId
+      Tags:
+        Project: !Ref PipelineName
+        ManagedBy: CloudFormation
+
+  PipelineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${PipelineName}-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: imagebuilder.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/EC2ImageBuilderExecutionPolicy
+      Policies:
+        - PolicyName: ImageBuilderWorkflowPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt ImageBuilderRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ec2.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:AddTagsToResource
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ami/${PipelineName}/*"
+      Tags:
+        - Key: Project
+          Value: !Ref PipelineName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  STIGPipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: !Sub "${PipelineName}"
+      ImageRecipeArn: !GetAtt STIGImageRecipe.Arn
+      InfrastructureConfigurationArn: !GetAtt InfrastructureConfig.Arn
+      DistributionConfigurationArn: !GetAtt DistributionConfig.Arn
+      ImageTestsConfiguration:
+        ImageTestsEnabled: true
+        TimeoutMinutes: 60
+      Status: ENABLED
+      ExecutionRole: !GetAtt PipelineExecutionRole.Arn
+      Workflows:
+        - WorkflowArn: !GetAtt BuildWorkflow.Arn
+        - WorkflowArn: !Sub "arn:aws:imagebuilder:${AWS::Region}:aws:workflow/test/test-image/x.x.x"
+      Tags:
+        Project: !Ref PipelineName
+        ManagedBy: CloudFormation
+
+  AmiParameterReaderRole:
+    Type: AWS::IAM::Role
+    Condition: ShareToOrganization
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_60
+            comment: "Trust is restricted by the aws:PrincipalOrgID condition; the role grants read-only access to one SSM parameter path."
+    Properties:
+      RoleName: !Sub "${PipelineName}-ami-reader"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: "*"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+      Policies:
+        - PolicyName: ReadAmiParameter
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ami/${PipelineName}/*"
+      Tags:
+        - Key: Project
+          Value: !Ref PipelineName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PipelineTriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: AutoTriggerEnabled
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs default encryption at rest; trigger logs contain no sensitive data."
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${PipelineName}-trigger"
+      RetentionInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref PipelineName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PipelineTriggerRole:
+    Type: AWS::IAM::Role
+    Condition: AutoTriggerEnabled
+    Properties:
+      RoleName: !Sub "${PipelineName}-trigger-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TriggerPipelinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: imagebuilder:StartImagePipelineExecution
+                Resource: !GetAtt STIGPipeline.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${PipelineName}-trigger:*"
+      Tags:
+        - Key: Project
+          Value: !Ref PipelineName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PipelineTriggerFunction:
+    Type: AWS::Lambda::Function
+    Condition: AutoTriggerEnabled
+    DependsOn: PipelineTriggerLogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "The function calls only the Image Builder API and accesses no VPC resources."
+          - id: CKV_AWS_116
+            comment: "SNS retries delivery; a missed trigger self-heals on the next base-image update or a manual start."
+          - id: CKV_AWS_173
+            comment: "The only environment variable is a non-sensitive pipeline ARN, encrypted at rest with the AWS managed key."
+    Properties:
+      FunctionName: !Sub "${PipelineName}-trigger"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt PipelineTriggerRole.Arn
+      Environment:
+        Variables:
+          PIPELINE_ARN: !GetAtt STIGPipeline.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          def handler(event, context):
+              client = boto3.client('imagebuilder')
+              pipeline_arn = os.environ['PIPELINE_ARN']
+
+              try:
+                  response = client.start_image_pipeline_execution(
+                      imagePipelineArn=pipeline_arn
+                  )
+                  return {
+                      'status': 'started',
+                      'response': response
+                  }
+              except client.exceptions.ResourceInUseException as error:
+                  return {
+                      'status': 'already_running',
+                      'message': str(error)
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref PipelineName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PipelineTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Condition: AutoTriggerEnabled
+    Properties:
+      FunctionName: !Ref PipelineTriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !FindInMap [AmiUpdateTopics, !Ref BaseImage, TopicArn]
+
+  AmiUpdateSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: AutoTriggerEnabled
+    Properties:
+      TopicArn: !FindInMap [AmiUpdateTopics, !Ref BaseImage, TopicArn]
+      Protocol: lambda
+      Endpoint: !GetAtt PipelineTriggerFunction.Arn
+
+  ImageNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${PipelineName}-image-notifications"
+      KmsMasterKeyId: !GetAtt NotificationEncryptionKey.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref PipelineName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ImageNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref ImageNotificationTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref ImageNotificationTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${PipelineName}-image-state-change"
+
+  ImageNotificationEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref ImageNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  ImageStateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${PipelineName}-image-state-change"
+      Description: "Notifies when an Image Builder image for this pipeline reaches AVAILABLE or FAILED"
+      EventPattern:
+        source:
+          - aws.imagebuilder
+        detail-type:
+          - "EC2 Image Builder Image State Change"
+        resources:
+          - prefix: !Sub "arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:image/${PipelineName}-stig-recipe/"
+        detail:
+          state:
+            status:
+              - AVAILABLE
+              - FAILED
+      State: ENABLED
+      Targets:
+        - Id: NotifyTopic
+          Arn: !Ref ImageNotificationTopic
+          InputTransformer:
+            InputPathsMap:
+              imageArn: "$.resources[0]"
+              status: "$.detail.state.status"
+            InputTemplate: '"Image Builder image <imageArn> is now <status>. Review the compliance reports in the pipeline reports bucket, under the reports prefix for this AMI."'
+
+  LifecycleExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: AmiLifecycleEnabled
+    Properties:
+      RoleName: !Sub "${PipelineName}-lifecycle-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: imagebuilder.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/EC2ImageBuilderLifecycleExecutionPolicy
+      Tags:
+        - Key: Project
+          Value: !Ref PipelineName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AmiLifecyclePolicy:
+    Type: AWS::ImageBuilder::LifecyclePolicy
+    Condition: AmiLifecycleEnabled
+    Properties:
+      Name: !Sub "${PipelineName}-ami-lifecycle"
+      Description: "Retains only the most recent AMIs for this pipeline and applies the selected action to older versions so workload accounts can only launch current images."
+      ExecutionRole: !GetAtt LifecycleExecutionRole.Arn
+      ResourceType: AMI_IMAGE
+      Status: ENABLED
+      ResourceSelection:
+        Recipes:
+          - Name: !Sub "${PipelineName}-stig-recipe"
+            SemanticVersion: "x.x.x"
+      PolicyDetails:
+        - Action:
+            Type: !Ref AmiLifecycleAction
+            IncludeResources:
+              Amis: true
+          Filter:
+            Type: COUNT
+            Value: !Ref KeepLatestCount
+      Tags:
+        Project: !Ref PipelineName
+        ManagedBy: CloudFormation
+
+Outputs:
+  PipelineExecutionRoleArn:
+    Description: "ARN of the IAM execution role used by the Image Builder pipeline for custom workflows"
+    Value: !GetAtt PipelineExecutionRole.Arn
+
+  PipelineArn:
+    Description: "ARN of the EC2 Image Builder pipeline for triggering builds and automation integration"
+    Value: !GetAtt STIGPipeline.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-PipelineArn"
+
+  RoleArn:
+    Description: "ARN of the IAM role used by the Image Builder build instance"
+    Value: !GetAtt ImageBuilderRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RoleArn"
+
+  PipelineExecutionInfo:
+    Description: "To trigger the pipeline, run: aws imagebuilder start-image-pipeline-execution --image-pipeline-arn <PipelineArn>. To retrieve the AMI ID, use: aws imagebuilder list-image-pipeline-images --image-pipeline-arn <PipelineArn> and check the outputResources.amis[0].image field."
+    Value: "See Description for pipeline execution instructions"
+
+  InstanceProfileArn:
+    Description: "ARN of the IAM instance profile used by Image Builder build instances"
+    Value: !GetAtt ImageBuilderInstanceProfile.Arn
+
+  OpenSCAPScanComponentArn:
+    Description: "ARN of the OpenSCAP assessment component"
+    Value: !GetAtt OpenSCAPScanComponent.Arn
+
+  OpenSCAPGateComponentArn:
+    Description: "ARN of the release-gate component"
+    Value: !GetAtt OpenSCAPGateComponent.Arn
+
+  STIGImageRecipeArn:
+    Description: "ARN of the STIG-hardened image recipe"
+    Value: !GetAtt STIGImageRecipe.Arn
+
+  InfrastructureConfigArn:
+    Description: "ARN of the Image Builder infrastructure configuration"
+    Value: !GetAtt InfrastructureConfig.Arn
+
+  DistributionConfigArn:
+    Description: "ARN of the Image Builder distribution configuration"
+    Value: !GetAtt DistributionConfig.Arn
+
+  BuildWorkflowArn:
+    Description: "ARN of the custom build workflow"
+    Value: !GetAtt BuildWorkflow.Arn
+
+  PipelineTriggerRoleArn:
+    Condition: AutoTriggerEnabled
+    Description: "ARN of the IAM role used by the optional Amazon Linux pipeline trigger Lambda function"
+    Value: !GetAtt PipelineTriggerRole.Arn
+
+  PipelineTriggerFunctionArn:
+    Condition: AutoTriggerEnabled
+    Description: "ARN of the optional Lambda function that triggers pipeline execution"
+    Value: !GetAtt PipelineTriggerFunction.Arn
+
+  AmiUpdateSubscriptionArn:
+    Condition: AutoTriggerEnabled
+    Description: "ARN of the optional SNS subscription for Amazon Linux AMI update notifications"
+    Value: !Ref AmiUpdateSubscription
+
+  LatestAmiParameterName:
+    Description: "SSM parameter name containing the latest STIG-hardened AMI ID"
+    Value: !Sub "/ami/${PipelineName}/latest"
+
+  ImageEncryptionKeyArn:
+    Description: "ARN of the customer-managed KMS key that encrypts Image Builder EBS volumes and distributed AMI snapshots"
+    Value: !GetAtt ImageEncryptionKey.Arn
+
+  NotificationEncryptionKeyArn:
+    Description: "ARN of the customer-managed KMS key that encrypts SNS build-state notifications"
+    Value: !GetAtt NotificationEncryptionKey.Arn
+
+  ComplianceReportsBucketName:
+    Description: "S3 bucket where OpenSCAP compliance reports are stored"
+    Value: !Ref ComplianceReportsBucket
+
+  AccessLogsBucketName:
+    Description: "S3 bucket that receives server access logs from the compliance reports bucket"
+    Value: !Ref AccessLogsBucket
+
+  ImageNotificationTopicArn:
+    Description: "Encrypted SNS topic that receives AVAILABLE/FAILED image build notifications. Subscribe email or other endpoints to receive alerts."
+    Value: !Ref ImageNotificationTopic
+
+  AmiLifecyclePolicyArn:
+    Condition: AmiLifecycleEnabled
+    Description: "ARN of the AMI lifecycle policy that enforces retention of only the most recent AMIs"
+    Value: !GetAtt AmiLifecyclePolicy.Arn
+
+  AmiParameterReaderRoleArn:
+    Condition: ShareToOrganization
+    Description: "ARN of the cross-account role that workload accounts assume to read the latest AMI parameter"
+    Value: !GetAtt AmiParameterReaderRole.Arn
