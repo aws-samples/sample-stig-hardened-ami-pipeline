@@ -19,11 +19,11 @@ Key capabilities:
 - **SSM parameter output:** Publish the latest AMI ID at `/ami/<PipelineName>/latest`.
 - **Custom build workflow:** Skip Image Builder InventoryCollection to avoid SSM conflicts after hardening changes firewall behavior.
 - **Report retention and access logging:** Store encrypted OpenSCAP reports in a versioned S3 bucket with lifecycle cleanup and server access logging to a separate encrypted, retained bucket. The destination policy accepts delivery only from the reports bucket in the same account.
-- **Organization governance:** Include an AWS Organizations Declarative Policy example for restricting EC2 launches to approved pipeline AMIs.
+- **Organization governance:** Include an AWS Organizations Declarative Policy example that narrows the externally provided AMIs workload accounts can launch to approved pipeline images.
 
 ## Architecture
 
-![Architecture diagram showing the pipeline account, where EC2 Image Builder builds, hardens, scans, and publishes an encrypted AMI with evidence retained in Amazon S3, and the workload OU, where a declarative policy restricts instance launches to the pipeline's AMIs](ARCHITECTURE.drawio.png)
+![Architecture diagram showing the pipeline account, where EC2 Image Builder builds, hardens, scans, and publishes an encrypted AMI with evidence retained in Amazon S3, and the workload OU, where a declarative policy narrows the externally provided AMIs that accounts can launch to the pipeline's images](ARCHITECTURE.drawio.png)
 
 Each build moves through the following stages, matching the numbered steps in the diagram:
 
@@ -398,7 +398,7 @@ To help restrict workload accounts to approved pipeline AMIs, use both:
 1. **AMI sharing:** Set `OrganizationId` so Image Builder shares successful AMIs with accounts in the organization.
 2. **Declarative policy:** Use `allowed-amis-policy.json` to configure EC2 Allowed AMIs criteria in workload accounts.
 
-**What this policy does and does not enforce.** Allowed AMIs criteria match on image provider and image name, so the policy restricts launches to images produced by this pipeline. It cannot evaluate the release-gate outcome, because [Allowed AMIs criteria do not support tags](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-allowed-amis.html). A gate-failed AMI carries the same name pattern as an approved one, so the name match alone does not distinguish it. What keeps rejected images out of workload use is the combination of: no organization sharing and no SSM parameter update on `FAIL` (an unshared AMI cannot be launched from another account), consumption through the SSM parameter, which only ever points at an image that passed, and the `StigGateDecision` tag for triage and for tag-based controls inside the pipeline account.
+**What this policy does and does not enforce.** Allowed AMIs criteria match on image provider and image name, so the policy narrows the externally provided images a workload account can discover and launch to those produced by this pipeline. It does not restrict AMIs the account owns itself: those stay discoverable and usable whatever criteria you set, so pair this with your own controls on local image creation wherever workload accounts can build their own images. Enable [audit mode](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/manage-settings-allowed-amis.html) first to preview which images the criteria would hide. The policy also cannot evaluate the release-gate outcome, because [Allowed AMIs criteria do not support tags](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-allowed-amis.html). A gate-failed AMI carries the same name pattern as an approved one, so the name match alone does not distinguish it. What keeps rejected images out of workload use is the combination of: no organization sharing and no SSM parameter update on `FAIL` (an unshared AMI cannot be launched from another account), consumption through the SSM parameter, which only ever points at an image that passed, and the `StigGateDecision` tag for triage and for tag-based controls inside the pipeline account.
 
 Before applying the policy, replace both placeholders in `allowed-amis-policy.json`:
 
@@ -445,11 +445,11 @@ Evaluate source-image policy separately for the pipeline account. Image Builder 
 
 ### Ensuring workload accounts use only the latest AMI
 
-The Allowed AMIs policy restricts launches to your pipeline's AMIs, but it matches a name pattern, so it still allows older builds. To ensure only the most recent image is usable, combine three layers:
+The Allowed AMIs policy narrows which externally provided AMIs workload accounts can discover and launch, but it matches a name pattern, so it still allows older builds. To ensure only the most recent image is usable, combine three layers:
 
 1. **Consume through SSM:** Have workload deployments resolve `/ami/<PipelineName>/latest` (for example `{{resolve:ssm:/ami/<PipelineName>/latest}}` in CloudFormation, or an SSM data source in Terraform, or a launch template that reads the parameter). A new successful build updates this parameter automatically, so new deployments pick up the latest approved image.
 2. **Retire older AMIs (lifecycle policy):** Set `EnableAmiLifecycle=true` to create an EC2 Image Builder lifecycle policy that keeps `KeepLatestCount` recent AMIs and applies `AmiLifecycleAction` to older ones. Because AMIs are shared to the organization through launch permissions (they stay in the pipeline account), a `DISABLE` or `DELETE` action on an older AMI immediately removes the ability for any account to launch it, leaving only the recent images. `DEPRECATE` only marks images and does not block launches.
-3. **Allowed AMIs guardrail:** Keep the Declarative Policy attached to workload OUs so nothing outside the pipeline's AMIs can launch at all.
+3. **Allowed AMIs guardrail:** Keep the Declarative Policy attached to workload OUs so the pipeline's images stay the only externally provided AMIs those accounts can discover and launch.
 
 Recommended: `KeepLatestCount=2` (latest plus one for rollback) with `AmiLifecycleAction=DISABLE` for reversible enforcement, moving to `DELETE` once you are comfortable. The lifecycle policy runs on an AWS-managed schedule, so retirement of older AMIs is not instantaneous.
 
